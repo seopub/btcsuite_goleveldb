@@ -23,13 +23,13 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/syndtr/goleveldb/leveldb/comparer"
-	"github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/filter"
-	"github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/storage"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/btcsuite/goleveldb/leveldb/comparer"
+	"github.com/btcsuite/goleveldb/leveldb/errors"
+	"github.com/btcsuite/goleveldb/leveldb/filter"
+	"github.com/btcsuite/goleveldb/leveldb/iterator"
+	"github.com/btcsuite/goleveldb/leveldb/opt"
+	"github.com/btcsuite/goleveldb/leveldb/storage"
+	"github.com/btcsuite/goleveldb/leveldb/util"
 )
 
 func tkey(i int) []byte {

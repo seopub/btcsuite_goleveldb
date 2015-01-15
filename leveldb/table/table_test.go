@@ -12,10 +12,10 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	"github.com/syndtr/goleveldb/leveldb/iterator"
-	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/testutil"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/btcsuite/goleveldb/leveldb/iterator"
+	"github.com/btcsuite/goleveldb/leveldb/opt"
+	"github.com/btcsuite/goleveldb/leveldb/testutil"
+	"github.com/btcsuite/goleveldb/leveldb/util"
 )
 
 type tableWrapper struct {
