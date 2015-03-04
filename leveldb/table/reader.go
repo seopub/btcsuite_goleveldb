@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 
-	"code.google.com/p/snappy-go/snappy"
-
 	"github.com/btcsuite/goleveldb/leveldb/cache"
 	"github.com/btcsuite/goleveldb/leveldb/comparer"
 	"github.com/btcsuite/goleveldb/leveldb/errors"
@@ -24,6 +22,7 @@ import (
 	"github.com/btcsuite/goleveldb/leveldb/opt"
 	"github.com/btcsuite/goleveldb/leveldb/storage"
 	"github.com/btcsuite/goleveldb/leveldb/util"
+	"github.com/btcsuite/snappy-go/snappy"
 )
 
 var (
