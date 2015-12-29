@@ -41,15 +41,18 @@ func (lock *fileStorageLock) Release() {
 	return
 }
 
+const logSizeThreshold = 1024 * 1024 // 1 MiB
+
 // fileStorage is a file-system backed storage.
 type fileStorage struct {
 	path string
 
-	mu    sync.Mutex
-	flock fileLock
-	slock *fileStorageLock
-	logw  *os.File
-	buf   []byte
+	mu      sync.Mutex
+	flock   fileLock
+	slock   *fileStorageLock
+	logw    *os.File
+	logSize int
+	buf     []byte
 	// Opened file counter; if open < 0 means closed.
 	open int
 	day  int
@@ -81,8 +84,13 @@ func OpenFile(path string) (Storage, error) {
 	if err != nil {
 		return nil, err
 	}
+	logSize, err := logw.Seek(0, os.SEEK_END)
+	if err != nil {
+		logw.Close()
+		return nil, err
+	}
 
-	fs := &fileStorage{path: path, flock: flock, logw: logw}
+	fs := &fileStorage{path: path, flock: flock, logw: logw, logSize: int(logSize)}
 	runtime.SetFinalizer(fs, (*fileStorage).Close)
 	return fs, nil
 }
@@ -126,6 +134,22 @@ func (fs *fileStorage) printDay(t time.Time) {
 }
 
 func (fs *fileStorage) doLog(t time.Time, str string) {
+	if fs.logSize > logSizeThreshold {
+		// Rotate log file.
+		fs.logw.Close()
+		fs.logw = nil
+		fs.logSize = 0
+		rename(filepath.Join(fs.path, "LOG"), filepath.Join(fs.path, "LOG.old"))
+	}
+	if fs.logw == nil {
+		var err error
+		fs.logw, err = os.OpenFile(filepath.Join(fs.path, "LOG"), os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			return
+		}
+		// Force printDay on new log file.
+		fs.day = 0
+	}
 	fs.printDay(t)
 	hour, min, sec := t.Clock()
 	msec := t.Nanosecond() / 1e3
@@ -243,7 +267,10 @@ func (fs *fileStorage) GetManifest() (f File, err error) {
 					rem = append(rem, fn)
 				}
 				if !pend1 || cerr == nil {
-					cerr = fmt.Errorf("leveldb/storage: corrupted or incomplete %s file", fn)
+					cerr = &ErrCorrupted{
+						File: fsParseName(filepath.Base(fn)),
+						Err:  errors.New("leveldb/storage: corrupted or incomplete manifest file"),
+					}
 				}
 			} else if f != nil && f1.Num() < f.Num() {
 				fs.log(fmt.Sprintf("skipping %s: obsolete", fn))
@@ -326,16 +353,13 @@ func (fs *fileStorage) Close() error {
 	runtime.SetFinalizer(fs, nil)
 
 	if fs.open > 0 {
-		fs.log(fmt.Sprintf("refuse to close, %d files still open", fs.open))
-		return fmt.Errorf("leveldb/storage: cannot close, %d files still open", fs.open)
+		fs.log(fmt.Sprintf("close: warning, %d files still open", fs.open))
 	}
 	fs.open = -1
-	e1 := fs.logw.Close()
-	err := fs.flock.release()
-	if err == nil {
-		err = e1
+	if fs.logw != nil {
+		fs.logw.Close()
 	}
-	return err
+	return fs.flock.release()
 }
 
 type fileWrap struct {
@@ -505,30 +529,37 @@ func (f *file) path() string {
 	return filepath.Join(f.fs.path, f.name())
 }
 
-func (f *file) parse(name string) bool {
-	var num uint64
+func fsParseName(name string) *FileInfo {
+	fi := &FileInfo{}
 	var tail string
-	_, err := fmt.Sscanf(name, "%d.%s", &num, &tail)
+	_, err := fmt.Sscanf(name, "%d.%s", &fi.Num, &tail)
 	if err == nil {
 		switch tail {
 		case "log":
-			f.t = TypeJournal
+			fi.Type = TypeJournal
 		case "ldb", "sst":
-			f.t = TypeTable
+			fi.Type = TypeTable
 		case "tmp":
-			f.t = TypeTemp
+			fi.Type = TypeTemp
 		default:
-			return false
+			return nil
 		}
-		f.num = num
-		return true
+		return fi
 	}
-	n, _ := fmt.Sscanf(name, "MANIFEST-%d%s", &num, &tail)
+	n, _ := fmt.Sscanf(name, "MANIFEST-%d%s", &fi.Num, &tail)
 	if n == 1 {
-		f.t = TypeManifest
-		f.num = num
-		return true
+		fi.Type = TypeManifest
+		return fi
 	}
+	return nil
+}
 
-	return false
+func (f *file) parse(name string) bool {
+	fi := fsParseName(name)
+	if fi == nil {
+		return false
+	}
+	f.t = fi.Type
+	f.num = fi.Num
+	return true
 }

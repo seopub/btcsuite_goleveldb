@@ -22,7 +22,7 @@ import (
 	"github.com/btcsuite/goleveldb/leveldb/opt"
 	"github.com/btcsuite/goleveldb/leveldb/storage"
 	"github.com/btcsuite/goleveldb/leveldb/util"
-	"github.com/btcsuite/snappy-go/snappy"
+	"github.com/btcsuite/snappy-go"
 )
 
 var (

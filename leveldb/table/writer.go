@@ -16,7 +16,7 @@ import (
 	"github.com/btcsuite/goleveldb/leveldb/filter"
 	"github.com/btcsuite/goleveldb/leveldb/opt"
 	"github.com/btcsuite/goleveldb/leveldb/util"
-	"github.com/btcsuite/snappy-go/snappy"
+	"github.com/btcsuite/snappy-go"
 )
 
 func sharedPrefixLen(a, b []byte) int {
@@ -166,11 +166,7 @@ func (w *Writer) writeBlock(buf *util.Buffer, compression opt.Compression) (bh b
 		if n := snappy.MaxEncodedLen(buf.Len()) + blockTrailerLen; len(w.compressionScratch) < n {
 			w.compressionScratch = make([]byte, n)
 		}
-		var compressed []byte
-		compressed, err = snappy.Encode(w.compressionScratch, buf.Bytes())
-		if err != nil {
-			return
-		}
+		compressed := snappy.Encode(w.compressionScratch, buf.Bytes())
 		n := len(compressed)
 		b = compressed[:n+blockTrailerLen]
 		b[n] = blockTypeSnappyCompression
