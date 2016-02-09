@@ -23,12 +23,15 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/onsi/gomega"
+
 	"github.com/btcsuite/goleveldb/leveldb/comparer"
 	"github.com/btcsuite/goleveldb/leveldb/errors"
 	"github.com/btcsuite/goleveldb/leveldb/filter"
 	"github.com/btcsuite/goleveldb/leveldb/iterator"
 	"github.com/btcsuite/goleveldb/leveldb/opt"
 	"github.com/btcsuite/goleveldb/leveldb/storage"
+	"github.com/btcsuite/goleveldb/leveldb/testutil"
 	"github.com/btcsuite/goleveldb/leveldb/util"
 )
 
@@ -41,10 +44,23 @@ func tval(seed, n int) []byte {
 	return randomString(r, n)
 }
 
+func testingLogger(t *testing.T) func(log string) {
+	return func(log string) {
+		t.Log(log)
+	}
+}
+
+func testingPreserveOnFailed(t *testing.T) func() (preserve bool, err error) {
+	return func() (preserve bool, err error) {
+		preserve = t.Failed()
+		return
+	}
+}
+
 type dbHarness struct {
 	t *testing.T
 
-	stor *testStorage
+	stor *testutil.Storage
 	db   *DB
 	o    *opt.Options
 	ro   *opt.ReadOptions
@@ -58,12 +74,15 @@ func newDbHarnessWopt(t *testing.T, o *opt.Options) *dbHarness {
 }
 
 func newDbHarness(t *testing.T) *dbHarness {
-	return newDbHarnessWopt(t, &opt.Options{})
+	return newDbHarnessWopt(t, &opt.Options{DisableLargeBatchTransaction: true})
 }
 
 func (h *dbHarness) init(t *testing.T, o *opt.Options) {
+	gomega.RegisterTestingT(t)
 	h.t = t
-	h.stor = newTestStorage(t)
+	h.stor = testutil.NewStorage()
+	h.stor.OnLog(testingLogger(t))
+	h.stor.OnClose(testingPreserveOnFailed(t))
 	h.o = o
 	h.ro = nil
 	h.wo = nil
@@ -93,21 +112,28 @@ func (h *dbHarness) closeDB0() error {
 }
 
 func (h *dbHarness) closeDB() {
-	if err := h.closeDB0(); err != nil {
-		h.t.Error("Close: got error: ", err)
+	if h.db != nil {
+		if err := h.closeDB0(); err != nil {
+			h.t.Error("Close: got error: ", err)
+		}
+		h.db = nil
 	}
 	h.stor.CloseCheck()
 	runtime.GC()
 }
 
 func (h *dbHarness) reopenDB() {
-	h.closeDB()
+	if h.db != nil {
+		h.closeDB()
+	}
 	h.openDB()
 }
 
 func (h *dbHarness) close() {
-	h.closeDB0()
-	h.db = nil
+	if h.db != nil {
+		h.closeDB0()
+		h.db = nil
+	}
 	h.stor.Close()
 	h.stor = nil
 	runtime.GC()
@@ -149,24 +175,26 @@ func (h *dbHarness) putMulti(n int, low, hi string) {
 	}
 }
 
-func (h *dbHarness) maxNextLevelOverlappingBytes(want uint64) {
+func (h *dbHarness) maxNextLevelOverlappingBytes(want int64) {
 	t := h.t
 	db := h.db
 
 	var (
-		maxOverlaps uint64
+		maxOverlaps int64
 		maxLevel    int
 	)
 	v := db.s.version()
-	for i, tt := range v.tables[1 : len(v.tables)-1] {
-		level := i + 1
-		next := v.tables[level+1]
-		for _, t := range tt {
-			r := next.getOverlaps(nil, db.s.icmp, t.imin.ukey(), t.imax.ukey(), false)
-			sum := r.size()
-			if sum > maxOverlaps {
-				maxOverlaps = sum
-				maxLevel = level
+	if len(v.levels) > 2 {
+		for i, tt := range v.levels[1 : len(v.levels)-1] {
+			level := i + 1
+			next := v.levels[level+1]
+			for _, t := range tt {
+				r := next.getOverlaps(nil, db.s.icmp, t.imin.ukey(), t.imax.ukey(), false)
+				sum := r.size()
+				if sum > maxOverlaps {
+					maxOverlaps = sum
+					maxLevel = level
+				}
 			}
 		}
 	}
@@ -248,8 +276,8 @@ func (h *dbHarness) allEntriesFor(key, want string) {
 	db := h.db
 	s := db.s
 
-	ikey := newIkey([]byte(key), kMaxSeq, ktVal)
-	iter := db.newRawIterator(nil, nil)
+	ikey := makeIkey(nil, []byte(key), kMaxSeq, ktVal)
+	iter := db.newRawIterator(nil, nil, nil, nil)
 	if !iter.Seek(ikey) && iter.Error() != nil {
 		t.Error("AllEntries: error during seek, err: ", iter.Error())
 		return
@@ -315,7 +343,7 @@ func (h *dbHarness) getKeyVal(want string) {
 func (h *dbHarness) waitCompaction() {
 	t := h.t
 	db := h.db
-	if err := db.compSendIdle(db.tcompCmdC); err != nil {
+	if err := db.compTriggerWait(db.tcompCmdC); err != nil {
 		t.Error("compaction error: ", err)
 	}
 }
@@ -324,7 +352,7 @@ func (h *dbHarness) waitMemCompaction() {
 	t := h.t
 	db := h.db
 
-	if err := db.compSendIdle(db.mcompCmdC); err != nil {
+	if err := db.compTriggerWait(db.mcompCmdC); err != nil {
 		t.Error("compaction error: ", err)
 	}
 }
@@ -340,10 +368,7 @@ func (h *dbHarness) compactMem() {
 		<-db.writeLockC
 	}()
 
-	if _, err := db.rotateMem(0); err != nil {
-		t.Error("compaction error: ", err)
-	}
-	if err := db.compSendIdle(db.mcompCmdC); err != nil {
+	if _, err := db.rotateMem(0, true); err != nil {
 		t.Error("compaction error: ", err)
 	}
 
@@ -368,7 +393,7 @@ func (h *dbHarness) compactRangeAtErr(level int, min, max string, wanterr bool) 
 
 	t.Logf("starting table range compaction: level=%d, min=%q, max=%q", level, min, max)
 
-	if err := db.compSendRange(db.tcompCmdC, level, _min, _max); err != nil {
+	if err := db.compTriggerRange(db.tcompCmdC, level, _min, _max); err != nil {
 		if wanterr {
 			t.Log("CompactRangeAt: got error (expected): ", err)
 		} else {
@@ -430,21 +455,26 @@ func (h *dbHarness) getSnapshot() (s *Snapshot) {
 	}
 	return
 }
-func (h *dbHarness) tablesPerLevel(want string) {
+
+func (h *dbHarness) getTablesPerLevel() string {
 	res := ""
 	nz := 0
 	v := h.db.s.version()
-	for level, tt := range v.tables {
+	for level, tables := range v.levels {
 		if level > 0 {
 			res += ","
 		}
-		res += fmt.Sprint(len(tt))
-		if len(tt) > 0 {
+		res += fmt.Sprint(len(tables))
+		if len(tables) > 0 {
 			nz = len(res)
 		}
 	}
 	v.release()
-	res = res[:nz]
+	return res[:nz]
+}
+
+func (h *dbHarness) tablesPerLevel(want string) {
+	res := h.getTablesPerLevel()
 	if res != want {
 		h.t.Errorf("invalid tables len, want=%s, got=%s", want, res)
 	}
@@ -452,8 +482,8 @@ func (h *dbHarness) tablesPerLevel(want string) {
 
 func (h *dbHarness) totalTables() (n int) {
 	v := h.db.s.version()
-	for _, tt := range v.tables {
-		n += len(tt)
+	for _, tables := range v.levels {
+		n += len(tables)
 	}
 	v.release()
 	return
@@ -484,7 +514,7 @@ func truno(t *testing.T, o *opt.Options, f func(h *dbHarness)) {
 			case 0:
 			case 1:
 				if o == nil {
-					o = &opt.Options{Filter: _bloom_filter}
+					o = &opt.Options{DisableLargeBatchTransaction: true, Filter: _bloom_filter}
 				} else {
 					old := o
 					o = &opt.Options{}
@@ -493,7 +523,7 @@ func truno(t *testing.T, o *opt.Options, f func(h *dbHarness)) {
 				}
 			case 2:
 				if o == nil {
-					o = &opt.Options{Compression: opt.NoCompression}
+					o = &opt.Options{DisableLargeBatchTransaction: true, Compression: opt.NoCompression}
 				} else {
 					old := o
 					o = &opt.Options{}
@@ -591,24 +621,27 @@ func TestDB_EmptyBatch(t *testing.T) {
 }
 
 func TestDB_GetFromFrozen(t *testing.T) {
-	h := newDbHarnessWopt(t, &opt.Options{WriteBuffer: 100100})
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  100100,
+	})
 	defer h.close()
 
 	h.put("foo", "v1")
 	h.getVal("foo", "v1")
 
-	h.stor.DelaySync(storage.TypeTable)      // Block sync calls
-	h.put("k1", strings.Repeat("x", 100000)) // Fill memtable
-	h.put("k2", strings.Repeat("y", 100000)) // Trigger compaction
+	h.stor.Stall(testutil.ModeSync, storage.TypeTable) // Block sync calls
+	h.put("k1", strings.Repeat("x", 100000))           // Fill memtable
+	h.put("k2", strings.Repeat("y", 100000))           // Trigger compaction
 	for i := 0; h.db.getFrozenMem() == nil && i < 100; i++ {
 		time.Sleep(10 * time.Microsecond)
 	}
 	if h.db.getFrozenMem() == nil {
-		h.stor.ReleaseSync(storage.TypeTable)
+		h.stor.Release(testutil.ModeSync, storage.TypeTable)
 		t.Fatal("No frozen mem")
 	}
 	h.getVal("foo", "v1")
-	h.stor.ReleaseSync(storage.TypeTable) // Release sync calls
+	h.stor.Release(testutil.ModeSync, storage.TypeTable) // Release sync calls
 
 	h.reopenDB()
 	h.getVal("foo", "v1")
@@ -660,6 +693,8 @@ func TestDB_GetSnapshot(t *testing.T) {
 
 func TestDB_GetLevel0Ordering(t *testing.T) {
 	trun(t, func(h *dbHarness) {
+		h.db.memdbMaxLevel = 2
+
 		for i := 0; i < 4; i++ {
 			h.put("bar", fmt.Sprintf("b%d", i))
 			h.put("foo", fmt.Sprintf("v%d", i))
@@ -719,6 +754,8 @@ func TestDB_GetPicksCorrectFile(t *testing.T) {
 
 func TestDB_GetEncountersEmptyLevel(t *testing.T) {
 	trun(t, func(h *dbHarness) {
+		h.db.memdbMaxLevel = 2
+
 		// Arrange for the following to happen:
 		//   * sstable A in level 0
 		//   * nothing in level 1
@@ -859,13 +896,13 @@ func TestDB_RecoverWithEmptyJournal(t *testing.T) {
 }
 
 func TestDB_RecoverDuringMemtableCompaction(t *testing.T) {
-	truno(t, &opt.Options{WriteBuffer: 1000000}, func(h *dbHarness) {
+	truno(t, &opt.Options{DisableLargeBatchTransaction: true, WriteBuffer: 1000000}, func(h *dbHarness) {
 
-		h.stor.DelaySync(storage.TypeTable)
+		h.stor.Stall(testutil.ModeSync, storage.TypeTable)
 		h.put("big1", strings.Repeat("x", 10000000))
 		h.put("big2", strings.Repeat("y", 1000))
 		h.put("bar", "v2")
-		h.stor.ReleaseSync(storage.TypeTable)
+		h.stor.Release(testutil.ModeSync, storage.TypeTable)
 
 		h.reopenDB()
 		h.getVal("bar", "v2")
@@ -875,7 +912,7 @@ func TestDB_RecoverDuringMemtableCompaction(t *testing.T) {
 }
 
 func TestDB_MinorCompactionsHappen(t *testing.T) {
-	h := newDbHarnessWopt(t, &opt.Options{WriteBuffer: 10000})
+	h := newDbHarnessWopt(t, &opt.Options{DisableLargeBatchTransaction: true, WriteBuffer: 10000})
 	defer h.close()
 
 	n := 500
@@ -925,8 +962,9 @@ func TestDB_RecoverWithLargeJournal(t *testing.T) {
 
 func TestDB_CompactionsGenerateMultipleFiles(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
-		WriteBuffer: 10000000,
-		Compression: opt.NoCompression,
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  10000000,
+		Compression:                  opt.NoCompression,
 	})
 	defer h.close()
 
@@ -962,10 +1000,10 @@ func TestDB_CompactionsGenerateMultipleFiles(t *testing.T) {
 }
 
 func TestDB_RepeatedWritesToSameKey(t *testing.T) {
-	h := newDbHarnessWopt(t, &opt.Options{WriteBuffer: 100000})
+	h := newDbHarnessWopt(t, &opt.Options{DisableLargeBatchTransaction: true, WriteBuffer: 100000})
 	defer h.close()
 
-	maxTables := h.o.GetNumLevel() + h.o.GetWriteL0PauseTrigger()
+	maxTables := h.o.GetWriteL0PauseTrigger() + 7
 
 	value := strings.Repeat("v", 2*h.o.GetWriteBuffer())
 	for i := 0; i < 5*maxTables; i++ {
@@ -978,12 +1016,15 @@ func TestDB_RepeatedWritesToSameKey(t *testing.T) {
 }
 
 func TestDB_RepeatedWritesToSameKeyAfterReopen(t *testing.T) {
-	h := newDbHarnessWopt(t, &opt.Options{WriteBuffer: 100000})
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  100000,
+	})
 	defer h.close()
 
 	h.reopenDB()
 
-	maxTables := h.o.GetNumLevel() + h.o.GetWriteL0PauseTrigger()
+	maxTables := h.o.GetWriteL0PauseTrigger() + 7
 
 	value := strings.Repeat("v", 2*h.o.GetWriteBuffer())
 	for i := 0; i < 5*maxTables; i++ {
@@ -996,10 +1037,10 @@ func TestDB_RepeatedWritesToSameKeyAfterReopen(t *testing.T) {
 }
 
 func TestDB_SparseMerge(t *testing.T) {
-	h := newDbHarnessWopt(t, &opt.Options{Compression: opt.NoCompression})
+	h := newDbHarnessWopt(t, &opt.Options{DisableLargeBatchTransaction: true, Compression: opt.NoCompression})
 	defer h.close()
 
-	h.putMulti(h.o.GetNumLevel(), "A", "Z")
+	h.putMulti(7, "A", "Z")
 
 	// Suppose there is:
 	//    small amount of data with prefix A
@@ -1035,8 +1076,9 @@ func TestDB_SparseMerge(t *testing.T) {
 
 func TestDB_SizeOf(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
-		Compression: opt.NoCompression,
-		WriteBuffer: 10000000,
+		DisableLargeBatchTransaction: true,
+		Compression:                  opt.NoCompression,
+		WriteBuffer:                  10000000,
 	})
 	defer h.close()
 
@@ -1084,7 +1126,10 @@ func TestDB_SizeOf(t *testing.T) {
 }
 
 func TestDB_SizeOf_MixOfSmallAndLarge(t *testing.T) {
-	h := newDbHarnessWopt(t, &opt.Options{Compression: opt.NoCompression})
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: true,
+		Compression:                  opt.NoCompression,
+	})
 	defer h.close()
 
 	sizes := []uint64{
@@ -1192,9 +1237,11 @@ func TestDB_HiddenValuesAreRemoved(t *testing.T) {
 	trun(t, func(h *dbHarness) {
 		s := h.db.s
 
+		m := 2
+		h.db.memdbMaxLevel = m
+
 		h.put("foo", "v1")
 		h.compactMem()
-		m := h.o.GetMaxMemCompationLevel()
 		v := s.version()
 		num := v.tLen(m)
 		v.release()
@@ -1236,9 +1283,11 @@ func TestDB_DeletionMarkers2(t *testing.T) {
 	defer h.close()
 	s := h.db.s
 
+	m := 2
+	h.db.memdbMaxLevel = m
+
 	h.put("foo", "v1")
 	h.compactMem()
-	m := h.o.GetMaxMemCompationLevel()
 	v := s.version()
 	num := v.tLen(m)
 	v.release()
@@ -1273,8 +1322,13 @@ func TestDB_DeletionMarkers2(t *testing.T) {
 }
 
 func TestDB_CompactionTableOpenError(t *testing.T) {
-	h := newDbHarnessWopt(t, &opt.Options{OpenFilesCacheCapacity: -1})
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: true,
+		OpenFilesCacheCapacity:       -1,
+	})
 	defer h.close()
+
+	h.db.memdbMaxLevel = 2
 
 	im := 10
 	jm := 10
@@ -1288,17 +1342,17 @@ func TestDB_CompactionTableOpenError(t *testing.T) {
 	}
 
 	if n := h.totalTables(); n != im*2 {
-		t.Errorf("total tables is %d, want %d", n, im)
+		t.Errorf("total tables is %d, want %d", n, im*2)
 	}
 
-	h.stor.SetEmuErr(storage.TypeTable, tsOpOpen)
+	h.stor.EmulateError(testutil.ModeOpen, storage.TypeTable, errors.New("open error during table compaction"))
 	go h.db.CompactRange(util.Range{})
-	if err := h.db.compSendIdle(h.db.tcompCmdC); err != nil {
+	if err := h.db.compTriggerWait(h.db.tcompCmdC); err != nil {
 		t.Log("compaction error: ", err)
 	}
 	h.closeDB0()
 	h.openDB()
-	h.stor.SetEmuErr(0, tsOpOpen)
+	h.stor.EmulateError(testutil.ModeOpen, storage.TypeTable, nil)
 
 	for i := 0; i < im; i++ {
 		for j := 0; j < jm; j++ {
@@ -1309,9 +1363,7 @@ func TestDB_CompactionTableOpenError(t *testing.T) {
 
 func TestDB_OverlapInLevel0(t *testing.T) {
 	trun(t, func(h *dbHarness) {
-		if h.o.GetMaxMemCompationLevel() != 2 {
-			t.Fatal("fix test to reflect the config")
-		}
+		h.db.memdbMaxLevel = 2
 
 		// Fill levels 1 and 2 to disable the pushing of new memtables to levels > 0.
 		h.put("100", "v100")
@@ -1429,23 +1481,23 @@ func TestDB_ManifestWriteError(t *testing.T) {
 			h.compactMem()
 			h.getVal("foo", "bar")
 			v := h.db.s.version()
-			if n := v.tLen(h.o.GetMaxMemCompationLevel()); n != 1 {
+			if n := v.tLen(0); n != 1 {
 				t.Errorf("invalid total tables, want=1 got=%d", n)
 			}
 			v.release()
 
 			if i == 0 {
-				h.stor.SetEmuErr(storage.TypeManifest, tsOpWrite)
+				h.stor.EmulateError(testutil.ModeWrite, storage.TypeManifest, errors.New("manifest write error"))
 			} else {
-				h.stor.SetEmuErr(storage.TypeManifest, tsOpSync)
+				h.stor.EmulateError(testutil.ModeSync, storage.TypeManifest, errors.New("manifest sync error"))
 			}
 
 			// Merging compaction (will fail)
-			h.compactRangeAtErr(h.o.GetMaxMemCompationLevel(), "", "", true)
+			h.compactRangeAtErr(0, "", "", true)
 
 			h.db.Close()
-			h.stor.SetEmuErr(0, tsOpWrite)
-			h.stor.SetEmuErr(0, tsOpSync)
+			h.stor.EmulateError(testutil.ModeWrite, storage.TypeManifest, nil)
+			h.stor.EmulateError(testutil.ModeSync, storage.TypeManifest, nil)
 
 			// Should not lose data
 			h.openDB()
@@ -1563,8 +1615,9 @@ func (numberComparer) Successor(dst, b []byte) []byte    { return nil }
 
 func TestDB_CustomComparer(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
-		Comparer:    numberComparer{},
-		WriteBuffer: 1000,
+		DisableLargeBatchTransaction: true,
+		Comparer:                     numberComparer{},
+		WriteBuffer:                  1000,
 	})
 	defer h.close()
 
@@ -1595,9 +1648,7 @@ func TestDB_ManualCompaction(t *testing.T) {
 	h := newDbHarness(t)
 	defer h.close()
 
-	if h.o.GetMaxMemCompationLevel() != 2 {
-		t.Fatal("fix test to reflect the config")
-	}
+	h.db.memdbMaxLevel = 2
 
 	h.putMulti(3, "p", "q")
 	h.tablesPerLevel("1,1,1")
@@ -1631,8 +1682,9 @@ func TestDB_ManualCompaction(t *testing.T) {
 
 func TestDB_BloomFilter(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
-		DisableBlockCache: true,
-		Filter:            filter.NewBloomFilter(10),
+		DisableLargeBatchTransaction: true,
+		DisableBlockCache:            true,
+		Filter:                       filter.NewBloomFilter(10),
 	})
 	defer h.close()
 
@@ -1654,32 +1706,31 @@ func TestDB_BloomFilter(t *testing.T) {
 	h.compactMem()
 
 	// Prevent auto compactions triggered by seeks
-	h.stor.DelaySync(storage.TypeTable)
+	h.stor.Stall(testutil.ModeSync, storage.TypeTable)
 
 	// Lookup present keys. Should rarely read from small sstable.
-	h.stor.SetReadCounter(storage.TypeTable)
+	h.stor.ResetCounter(testutil.ModeRead, storage.TypeTable)
 	for i := 0; i < n; i++ {
 		h.getVal(key(i), key(i))
 	}
-	cnt := int(h.stor.ReadCounter())
+	cnt, _ := h.stor.Counter(testutil.ModeRead, storage.TypeTable)
 	t.Logf("lookup of %d present keys yield %d sstable I/O reads", n, cnt)
-
 	if min, max := n, n+2*n/100; cnt < min || cnt > max {
 		t.Errorf("num of sstable I/O reads of present keys not in range of %d - %d, got %d", min, max, cnt)
 	}
 
 	// Lookup missing keys. Should rarely read from either sstable.
-	h.stor.ResetReadCounter()
+	h.stor.ResetCounter(testutil.ModeRead, storage.TypeTable)
 	for i := 0; i < n; i++ {
 		h.get(key(i)+".missing", false)
 	}
-	cnt = int(h.stor.ReadCounter())
+	cnt, _ = h.stor.Counter(testutil.ModeRead, storage.TypeTable)
 	t.Logf("lookup of %d missing keys yield %d sstable I/O reads", n, cnt)
 	if max := 3 * n / 100; cnt > max {
 		t.Errorf("num of sstable I/O reads of missing keys was more than %d, got %d", max, cnt)
 	}
 
-	h.stor.ReleaseSync(storage.TypeTable)
+	h.stor.Release(testutil.ModeSync, storage.TypeTable)
 }
 
 func TestDB_Concurrent(t *testing.T) {
@@ -1751,7 +1802,7 @@ func TestDB_Concurrent2(t *testing.T) {
 	const n, n2 = 4, 4000
 
 	runtime.GOMAXPROCS(n*2 + 2)
-	truno(t, &opt.Options{WriteBuffer: 30}, func(h *dbHarness) {
+	truno(t, &opt.Options{DisableLargeBatchTransaction: true, WriteBuffer: 30}, func(h *dbHarness) {
 		var closeWg sync.WaitGroup
 		var stop uint32
 
@@ -1826,7 +1877,7 @@ func TestDB_CreateReopenDbOnFile(t *testing.T) {
 	defer os.RemoveAll(dbpath)
 
 	for i := 0; i < 3; i++ {
-		stor, err := storage.OpenFile(dbpath)
+		stor, err := storage.OpenFile(dbpath, false)
 		if err != nil {
 			t.Fatalf("(%d) cannot open storage: %s", i, err)
 		}
@@ -1889,7 +1940,10 @@ func TestDB_LeveldbIssue178(t *testing.T) {
 
 	// Disable compression since it affects the creation of layers and the
 	// code below is trying to test against a very specific scenario.
-	h := newDbHarnessWopt(t, &opt.Options{Compression: opt.NoCompression})
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: true,
+		Compression:                  opt.NoCompression,
+	})
 	defer h.close()
 
 	// Create first key range.
@@ -1950,7 +2004,8 @@ func TestDB_LeveldbIssue200(t *testing.T) {
 
 func TestDB_GoleveldbIssue74(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
-		WriteBuffer: 1 * opt.MiB,
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  1 * opt.MiB,
 	})
 	defer h.close()
 
@@ -2068,8 +2123,9 @@ func TestDB_GetProperties(t *testing.T) {
 
 func TestDB_GoleveldbIssue72and83(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
-		WriteBuffer:            1 * opt.MiB,
-		OpenFilesCacheCapacity: 3,
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  1 * opt.MiB,
+		OpenFilesCacheCapacity:       3,
 	})
 	defer h.close()
 
@@ -2201,9 +2257,10 @@ func TestDB_GoleveldbIssue72and83(t *testing.T) {
 
 func TestDB_TransientError(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
-		WriteBuffer:              128 * opt.KiB,
-		OpenFilesCacheCapacity:   3,
-		DisableCompactionBackoff: true,
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  128 * opt.KiB,
+		OpenFilesCacheCapacity:       3,
+		DisableCompactionBackoff:     true,
 	})
 	defer h.close()
 
@@ -2223,10 +2280,10 @@ func TestDB_TransientError(t *testing.T) {
 			key := fmt.Sprintf("KEY%8d", k)
 			b.Put([]byte(key), []byte(key+vtail))
 		}
-		h.stor.SetEmuRandErr(storage.TypeTable, tsOpOpen, tsOpRead, tsOpReadAt)
+		h.stor.EmulateError(testutil.ModeOpen|testutil.ModeRead, storage.TypeTable, errors.New("table transient read error"))
 		if err := h.db.Write(b, nil); err != nil {
 			t.Logf("WRITE #%d error: %v", i, err)
-			h.stor.SetEmuRandErr(0, tsOpOpen, tsOpRead, tsOpReadAt, tsOpWrite)
+			h.stor.EmulateError(testutil.ModeOpen|testutil.ModeRead, storage.TypeTable, nil)
 			for {
 				if err := h.db.Write(b, nil); err == nil {
 					break
@@ -2242,10 +2299,10 @@ func TestDB_TransientError(t *testing.T) {
 			key := fmt.Sprintf("KEY%8d", k)
 			b.Delete([]byte(key))
 		}
-		h.stor.SetEmuRandErr(storage.TypeTable, tsOpOpen, tsOpRead, tsOpReadAt)
+		h.stor.EmulateError(testutil.ModeOpen|testutil.ModeRead, storage.TypeTable, errors.New("table transient read error"))
 		if err := h.db.Write(b, nil); err != nil {
 			t.Logf("WRITE #%d  error: %v", i, err)
-			h.stor.SetEmuRandErr(0, tsOpOpen, tsOpRead, tsOpReadAt)
+			h.stor.EmulateError(testutil.ModeOpen|testutil.ModeRead, storage.TypeTable, nil)
 			for {
 				if err := h.db.Write(b, nil); err == nil {
 					break
@@ -2255,7 +2312,7 @@ func TestDB_TransientError(t *testing.T) {
 			}
 		}
 	}
-	h.stor.SetEmuRandErr(0, tsOpOpen, tsOpRead, tsOpReadAt)
+	h.stor.EmulateError(testutil.ModeOpen|testutil.ModeRead, storage.TypeTable, nil)
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
@@ -2314,9 +2371,10 @@ func TestDB_TransientError(t *testing.T) {
 
 func TestDB_UkeyShouldntHopAcrossTable(t *testing.T) {
 	h := newDbHarnessWopt(t, &opt.Options{
-		WriteBuffer:                 112 * opt.KiB,
-		CompactionTableSize:         90 * opt.KiB,
-		CompactionExpandLimitFactor: 1,
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  112 * opt.KiB,
+		CompactionTableSize:          90 * opt.KiB,
+		CompactionExpandLimitFactor:  1,
 	})
 	defer h.close()
 
@@ -2354,24 +2412,24 @@ func TestDB_UkeyShouldntHopAcrossTable(t *testing.T) {
 	h.compactMem()
 
 	h.waitCompaction()
-	for level, tables := range h.db.s.stVersion.tables {
+	for level, tables := range h.db.s.stVersion.levels {
 		for _, table := range tables {
-			t.Logf("L%d@%d %q:%q", level, table.file.Num(), table.imin, table.imax)
+			t.Logf("L%d@%d %q:%q", level, table.fd.Num, table.imin, table.imax)
 		}
 	}
 
 	h.compactRangeAt(0, "", "")
 	h.waitCompaction()
-	for level, tables := range h.db.s.stVersion.tables {
+	for level, tables := range h.db.s.stVersion.levels {
 		for _, table := range tables {
-			t.Logf("L%d@%d %q:%q", level, table.file.Num(), table.imin, table.imax)
+			t.Logf("L%d@%d %q:%q", level, table.fd.Num, table.imin, table.imax)
 		}
 	}
 	h.compactRangeAt(1, "", "")
 	h.waitCompaction()
-	for level, tables := range h.db.s.stVersion.tables {
+	for level, tables := range h.db.s.stVersion.levels {
 		for _, table := range tables {
-			t.Logf("L%d@%d %q:%q", level, table.file.Num(), table.imin, table.imax)
+			t.Logf("L%d@%d %q:%q", level, table.fd.Num, table.imin, table.imax)
 		}
 	}
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -2402,17 +2460,21 @@ func TestDB_UkeyShouldntHopAcrossTable(t *testing.T) {
 }
 
 func TestDB_TableCompactionBuilder(t *testing.T) {
-	stor := newTestStorage(t)
+	gomega.RegisterTestingT(t)
+	stor := testutil.NewStorage()
+	stor.OnLog(testingLogger(t))
+	stor.OnClose(testingPreserveOnFailed(t))
 	defer stor.Close()
 
 	const nSeq = 99
 
 	o := &opt.Options{
-		WriteBuffer:                 112 * opt.KiB,
-		CompactionTableSize:         43 * opt.KiB,
-		CompactionExpandLimitFactor: 1,
-		CompactionGPOverlapsFactor:  1,
-		DisableBlockCache:           true,
+		DisableLargeBatchTransaction: true,
+		WriteBuffer:                  112 * opt.KiB,
+		CompactionTableSize:          43 * opt.KiB,
+		CompactionExpandLimitFactor:  1,
+		CompactionGPOverlapsFactor:   1,
+		DisableBlockCache:            true,
 	}
 	s, err := newSession(stor, o)
 	if err != nil {
@@ -2436,7 +2498,7 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 			key := []byte(fmt.Sprintf("%09d", k))
 			seq += nSeq - 1
 			for x := uint64(0); x < nSeq; x++ {
-				if err := tw.append(newIkey(key, seq-x, ktVal), value); err != nil {
+				if err := tw.append(makeIkey(nil, key, seq-x, ktVal), value); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -2454,13 +2516,13 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 
 	// Build grandparent.
 	v := s.version()
-	c := newCompaction(s, v, 1, append(tFiles{}, v.tables[1]...))
+	c := newCompaction(s, v, 1, append(tFiles{}, v.levels[1]...))
 	rec := &sessionRecord{}
 	b := &tableCompactionBuilder{
 		s:         s,
 		c:         c,
 		rec:       rec,
-		stat1:     new(cStatsStaging),
+		stat1:     new(cStatStaging),
 		minSeq:    0,
 		strict:    true,
 		tableSize: o.CompactionTableSize/3 + 961,
@@ -2468,8 +2530,8 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 	if err := b.run(new(compactionTransactCounter)); err != nil {
 		t.Fatal(err)
 	}
-	for _, t := range c.tables[0] {
-		rec.delTable(c.level, t.file.Num())
+	for _, t := range c.levels[0] {
+		rec.delTable(c.sourceLevel, t.fd.Num)
 	}
 	if err := s.commit(rec); err != nil {
 		t.Fatal(err)
@@ -2478,13 +2540,13 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 
 	// Build level-1.
 	v = s.version()
-	c = newCompaction(s, v, 0, append(tFiles{}, v.tables[0]...))
+	c = newCompaction(s, v, 0, append(tFiles{}, v.levels[0]...))
 	rec = &sessionRecord{}
 	b = &tableCompactionBuilder{
 		s:         s,
 		c:         c,
 		rec:       rec,
-		stat1:     new(cStatsStaging),
+		stat1:     new(cStatStaging),
 		minSeq:    0,
 		strict:    true,
 		tableSize: o.CompactionTableSize,
@@ -2492,12 +2554,12 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 	if err := b.run(new(compactionTransactCounter)); err != nil {
 		t.Fatal(err)
 	}
-	for _, t := range c.tables[0] {
-		rec.delTable(c.level, t.file.Num())
+	for _, t := range c.levels[0] {
+		rec.delTable(c.sourceLevel, t.fd.Num)
 	}
 	// Move grandparent to level-3
-	for _, t := range v.tables[2] {
-		rec.delTable(2, t.file.Num())
+	for _, t := range v.levels[2] {
+		rec.delTable(2, t.fd.Num)
 		rec.addTableFile(3, t)
 	}
 	if err := s.commit(rec); err != nil {
@@ -2506,36 +2568,35 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 	c.release()
 
 	v = s.version()
-	for level, want := range []bool{false, true, false, true, false} {
-		got := len(v.tables[level]) > 0
+	for level, want := range []bool{false, true, false, true} {
+		got := len(v.levels[level]) > 0
 		if want != got {
 			t.Fatalf("invalid level-%d tables len: want %v, got %v", level, want, got)
 		}
 	}
-	for i, f := range v.tables[1][:len(v.tables[1])-1] {
-		nf := v.tables[1][i+1]
+	for i, f := range v.levels[1][:len(v.levels[1])-1] {
+		nf := v.levels[1][i+1]
 		if bytes.Equal(f.imax.ukey(), nf.imin.ukey()) {
-			t.Fatalf("KEY %q hop across table %d .. %d", f.imax.ukey(), f.file.Num(), nf.file.Num())
+			t.Fatalf("KEY %q hop across table %d .. %d", f.imax.ukey(), f.fd.Num, nf.fd.Num)
 		}
 	}
 	v.release()
 
 	// Compaction with transient error.
 	v = s.version()
-	c = newCompaction(s, v, 1, append(tFiles{}, v.tables[1]...))
+	c = newCompaction(s, v, 1, append(tFiles{}, v.levels[1]...))
 	rec = &sessionRecord{}
 	b = &tableCompactionBuilder{
 		s:         s,
 		c:         c,
 		rec:       rec,
-		stat1:     new(cStatsStaging),
+		stat1:     new(cStatStaging),
 		minSeq:    0,
 		strict:    true,
 		tableSize: o.CompactionTableSize,
 	}
-	stor.SetEmuErrOnce(storage.TypeTable, tsOpSync)
-	stor.SetEmuRandErr(storage.TypeTable, tsOpRead, tsOpReadAt, tsOpWrite)
-	stor.SetEmuRandErrProb(0xf0)
+	stor.EmulateErrorOnce(testutil.ModeSync, storage.TypeTable, errors.New("table sync error (once)"))
+	stor.EmulateRandomError(testutil.ModeRead|testutil.ModeWrite, storage.TypeTable, 0.01, errors.New("table random IO error"))
 	for {
 		if err := b.run(new(compactionTransactCounter)); err != nil {
 			t.Logf("(expected) b.run: %v", err)
@@ -2548,15 +2609,15 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 	}
 	c.release()
 
-	stor.SetEmuErrOnce(0, tsOpSync)
-	stor.SetEmuRandErr(0, tsOpRead, tsOpReadAt, tsOpWrite)
+	stor.EmulateErrorOnce(testutil.ModeSync, storage.TypeTable, nil)
+	stor.EmulateRandomError(testutil.ModeRead|testutil.ModeWrite, storage.TypeTable, 0, nil)
 
 	v = s.version()
-	if len(v.tables[1]) != len(v.tables[2]) {
-		t.Fatalf("invalid tables length, want %d, got %d", len(v.tables[1]), len(v.tables[2]))
+	if len(v.levels[1]) != len(v.levels[2]) {
+		t.Fatalf("invalid tables length, want %d, got %d", len(v.levels[1]), len(v.levels[2]))
 	}
-	for i, f0 := range v.tables[1] {
-		f1 := v.tables[2][i]
+	for i, f0 := range v.levels[1] {
+		f1 := v.levels[2][i]
 		iter0 := s.tops.newIterator(f0, nil, nil)
 		iter1 := s.tops.newIterator(f1, nil, nil)
 		for j := 0; true; j++ {
@@ -2589,10 +2650,13 @@ func testDB_IterTriggeredCompaction(t *testing.T, limitDiv int) {
 	)
 
 	h := newDbHarnessWopt(t, &opt.Options{
-		Compression:       opt.NoCompression,
-		DisableBlockCache: true,
+		DisableLargeBatchTransaction: true,
+		Compression:                  opt.NoCompression,
+		DisableBlockCache:            true,
 	})
 	defer h.close()
+
+	h.db.memdbMaxLevel = 2
 
 	key := func(x int) string {
 		return fmt.Sprintf("v%06d", x)
@@ -2681,7 +2745,8 @@ func TestDB_ReadOnly(t *testing.T) {
 		t.Fatalf("SetReadOnly error: %v", err)
 	}
 
-	h.stor.SetEmuErr(storage.TypeAll, tsOpCreate, tsOpReplace, tsOpRemove, tsOpWrite, tsOpWrite, tsOpSync)
+	mode := testutil.ModeCreate | testutil.ModeRemove | testutil.ModeRename | testutil.ModeWrite | testutil.ModeSync
+	h.stor.EmulateError(mode, storage.TypeAll, errors.New("read-only DB shouldn't writes"))
 
 	ro := func(key, value, wantValue string) {
 		if err := h.db.Put([]byte(key), []byte(value), h.wo); err != ErrReadOnly {
@@ -2698,4 +2763,35 @@ func TestDB_ReadOnly(t *testing.T) {
 	ro("foo", "vx", "v1")
 	ro("bar", "vx", "v2")
 	h.assertNumKeys(4)
+}
+
+func TestDB_BulkInsertDelete(t *testing.T) {
+	h := newDbHarnessWopt(t, &opt.Options{
+		DisableLargeBatchTransaction: true,
+		Compression:                  opt.NoCompression,
+		CompactionTableSize:          128 * opt.KiB,
+		CompactionTotalSize:          1 * opt.MiB,
+		WriteBuffer:                  256 * opt.KiB,
+	})
+	defer h.close()
+
+	const R = 100
+	const N = 2500
+	key := make([]byte, 4)
+	value := make([]byte, 256)
+	for i := 0; i < R; i++ {
+		offset := N * i
+		for j := 0; j < N; j++ {
+			binary.BigEndian.PutUint32(key, uint32(offset+j))
+			h.db.Put(key, value, nil)
+		}
+		for j := 0; j < N; j++ {
+			binary.BigEndian.PutUint32(key, uint32(offset+j))
+			h.db.Delete(key, nil)
+		}
+	}
+
+	if tot := h.totalTables(); tot > 10 {
+		t.Fatalf("too many uncompacted tables: %d (%s)", tot, h.getTablesPerLevel())
+	}
 }
