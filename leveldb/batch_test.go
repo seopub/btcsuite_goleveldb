@@ -15,7 +15,7 @@ import (
 )
 
 type tbRec struct {
-	kt         kType
+	kt         keyType
 	key, value []byte
 }
 
@@ -24,11 +24,11 @@ type testBatch struct {
 }
 
 func (p *testBatch) Put(key, value []byte) {
-	p.rec = append(p.rec, &tbRec{ktVal, key, value})
+	p.rec = append(p.rec, &tbRec{keyTypeVal, key, value})
 }
 
 func (p *testBatch) Delete(key []byte) {
-	p.rec = append(p.rec, &tbRec{ktDel, key, nil})
+	p.rec = append(p.rec, &tbRec{keyTypeDel, key, nil})
 }
 
 func compareBatch(t *testing.T, b1, b2 *Batch) {
@@ -55,7 +55,7 @@ func compareBatch(t *testing.T, b1, b2 *Batch) {
 		if !bytes.Equal(r1.key, r2.key) {
 			t.Errorf("invalid key on record '%d' want %s, got %s", i, string(r1.key), string(r2.key))
 		}
-		if r1.kt == ktVal {
+		if r1.kt == keyTypeVal {
 			if !bytes.Equal(r1.value, r2.value) {
 				t.Errorf("invalid value on record '%d' want %s, got %s", i, string(r1.value), string(r2.value))
 			}
@@ -100,6 +100,9 @@ func TestBatch_Append(t *testing.T) {
 	b2b.Put([]byte("bar"), []byte("barvalue"))
 	b2a.append(b2b)
 	compareBatch(t, b1, b2a)
+	if b1.size() != b2a.size() {
+		t.Fatalf("invalid batch size want %d, got %d", b1.size(), b2a.size())
+	}
 }
 
 func TestBatch_Size(t *testing.T) {

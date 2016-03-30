@@ -276,7 +276,7 @@ func (h *dbHarness) allEntriesFor(key, want string) {
 	db := h.db
 	s := db.s
 
-	ikey := makeIkey(nil, []byte(key), kMaxSeq, ktVal)
+	ikey := makeInternalKey(nil, []byte(key), keyMaxSeq, keyTypeVal)
 	iter := db.newRawIterator(nil, nil, nil, nil)
 	if !iter.Seek(ikey) && iter.Error() != nil {
 		t.Error("AllEntries: error during seek, err: ", iter.Error())
@@ -285,7 +285,7 @@ func (h *dbHarness) allEntriesFor(key, want string) {
 	res := "[ "
 	first := true
 	for iter.Valid() {
-		if ukey, _, kt, kerr := parseIkey(iter.Key()); kerr == nil {
+		if ukey, _, kt, kerr := parseInternalKey(iter.Key()); kerr == nil {
 			if s.icmp.uCompare(ikey.ukey(), ukey) != 0 {
 				break
 			}
@@ -294,9 +294,9 @@ func (h *dbHarness) allEntriesFor(key, want string) {
 			}
 			first = false
 			switch kt {
-			case ktVal:
+			case keyTypeVal:
 				res += string(iter.Value())
-			case ktDel:
+			case keyTypeDel:
 				res += "DEL"
 			}
 		} else {
@@ -430,7 +430,7 @@ func (h *dbHarness) compactRange(min, max string) {
 	t.Log("DB range compaction done")
 }
 
-func (h *dbHarness) sizeOf(start, limit string) uint64 {
+func (h *dbHarness) sizeOf(start, limit string) int64 {
 	sz, err := h.db.SizeOf([]util.Range{
 		{[]byte(start), []byte(limit)},
 	})
@@ -440,7 +440,7 @@ func (h *dbHarness) sizeOf(start, limit string) uint64 {
 	return sz.Sum()
 }
 
-func (h *dbHarness) sizeAssert(start, limit string, low, hi uint64) {
+func (h *dbHarness) sizeAssert(start, limit string, low, hi int64) {
 	sz := h.sizeOf(start, limit)
 	if sz < low || sz > hi {
 		h.t.Errorf("sizeOf %q to %q not in range, want %d - %d, got %d",
@@ -505,7 +505,7 @@ func numKey(num int) string {
 	return fmt.Sprintf("key%06d", num)
 }
 
-var _bloom_filter = filter.NewBloomFilter(10)
+var testingBloomFilter = filter.NewBloomFilter(10)
 
 func truno(t *testing.T, o *opt.Options, f func(h *dbHarness)) {
 	for i := 0; i < 4; i++ {
@@ -514,16 +514,22 @@ func truno(t *testing.T, o *opt.Options, f func(h *dbHarness)) {
 			case 0:
 			case 1:
 				if o == nil {
-					o = &opt.Options{DisableLargeBatchTransaction: true, Filter: _bloom_filter}
+					o = &opt.Options{
+						DisableLargeBatchTransaction: true,
+						Filter: testingBloomFilter,
+					}
 				} else {
 					old := o
 					o = &opt.Options{}
 					*o = *old
-					o.Filter = _bloom_filter
+					o.Filter = testingBloomFilter
 				}
 			case 2:
 				if o == nil {
-					o = &opt.Options{DisableLargeBatchTransaction: true, Compression: opt.NoCompression}
+					o = &opt.Options{
+						DisableLargeBatchTransaction: true,
+						Compression:                  opt.NoCompression,
+					}
 				} else {
 					old := o
 					o = &opt.Options{}
@@ -1103,13 +1109,13 @@ func TestDB_SizeOf(t *testing.T) {
 
 		for cs := 0; cs < n; cs += 10 {
 			for i := 0; i < n; i += 10 {
-				h.sizeAssert("", numKey(i), uint64(s1*i), uint64(s2*i))
-				h.sizeAssert("", numKey(i)+".suffix", uint64(s1*(i+1)), uint64(s2*(i+1)))
-				h.sizeAssert(numKey(i), numKey(i+10), uint64(s1*10), uint64(s2*10))
+				h.sizeAssert("", numKey(i), int64(s1*i), int64(s2*i))
+				h.sizeAssert("", numKey(i)+".suffix", int64(s1*(i+1)), int64(s2*(i+1)))
+				h.sizeAssert(numKey(i), numKey(i+10), int64(s1*10), int64(s2*10))
 			}
 
-			h.sizeAssert("", numKey(50), uint64(s1*50), uint64(s2*50))
-			h.sizeAssert("", numKey(50)+".suffix", uint64(s1*50), uint64(s2*50))
+			h.sizeAssert("", numKey(50), int64(s1*50), int64(s2*50))
+			h.sizeAssert("", numKey(50)+".suffix", int64(s1*50), int64(s2*50))
 
 			h.compactRangeAt(0, numKey(cs), numKey(cs+9))
 		}
@@ -1132,7 +1138,7 @@ func TestDB_SizeOf_MixOfSmallAndLarge(t *testing.T) {
 	})
 	defer h.close()
 
-	sizes := []uint64{
+	sizes := []int64{
 		10000,
 		10000,
 		100000,
@@ -1150,7 +1156,7 @@ func TestDB_SizeOf_MixOfSmallAndLarge(t *testing.T) {
 	for r := 0; r < 3; r++ {
 		h.reopenDB()
 
-		var x uint64
+		var x int64
 		for i, n := range sizes {
 			y := x
 			if i > 0 {
@@ -1734,139 +1740,165 @@ func TestDB_BloomFilter(t *testing.T) {
 }
 
 func TestDB_Concurrent(t *testing.T) {
-	const n, secs, maxkey = 4, 2, 1000
+	const n, secs, maxkey = 4, 6, 1000
+	h := newDbHarness(t)
+	defer h.close()
 
-	runtime.GOMAXPROCS(n)
-	trun(t, func(h *dbHarness) {
-		var closeWg sync.WaitGroup
-		var stop uint32
-		var cnt [n]uint32
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
-		for i := 0; i < n; i++ {
-			closeWg.Add(1)
-			go func(i int) {
-				var put, get, found uint
-				defer func() {
-					t.Logf("goroutine %d stopped after %d ops, put=%d get=%d found=%d missing=%d",
-						i, cnt[i], put, get, found, get-found)
-					closeWg.Done()
-				}()
+	var (
+		closeWg sync.WaitGroup
+		stop    uint32
+		cnt     [n]uint32
+	)
 
-				rnd := rand.New(rand.NewSource(int64(1000 + i)))
-				for atomic.LoadUint32(&stop) == 0 {
-					x := cnt[i]
+	for i := 0; i < n; i++ {
+		closeWg.Add(1)
+		go func(i int) {
+			var put, get, found uint
+			defer func() {
+				t.Logf("goroutine %d stopped after %d ops, put=%d get=%d found=%d missing=%d",
+					i, cnt[i], put, get, found, get-found)
+				closeWg.Done()
+			}()
 
-					k := rnd.Intn(maxkey)
-					kstr := fmt.Sprintf("%016d", k)
+			rnd := rand.New(rand.NewSource(int64(1000 + i)))
+			for atomic.LoadUint32(&stop) == 0 {
+				x := cnt[i]
 
-					if (rnd.Int() % 2) > 0 {
-						put++
-						h.put(kstr, fmt.Sprintf("%d.%d.%-1000d", k, i, x))
-					} else {
-						get++
-						v, err := h.db.Get([]byte(kstr), h.ro)
-						if err == nil {
-							found++
-							rk, ri, rx := 0, -1, uint32(0)
-							fmt.Sscanf(string(v), "%d.%d.%d", &rk, &ri, &rx)
-							if rk != k {
-								t.Errorf("invalid key want=%d got=%d", k, rk)
-							}
-							if ri < 0 || ri >= n {
-								t.Error("invalid goroutine number: ", ri)
-							} else {
-								tx := atomic.LoadUint32(&(cnt[ri]))
-								if rx > tx {
-									t.Errorf("invalid seq number, %d > %d ", rx, tx)
-								}
-							}
-						} else if err != ErrNotFound {
-							t.Error("Get: got error: ", err)
-							return
+				k := rnd.Intn(maxkey)
+				kstr := fmt.Sprintf("%016d", k)
+
+				if (rnd.Int() % 2) > 0 {
+					put++
+					h.put(kstr, fmt.Sprintf("%d.%d.%-1000d", k, i, x))
+				} else {
+					get++
+					v, err := h.db.Get([]byte(kstr), h.ro)
+					if err == nil {
+						found++
+						rk, ri, rx := 0, -1, uint32(0)
+						fmt.Sscanf(string(v), "%d.%d.%d", &rk, &ri, &rx)
+						if rk != k {
+							t.Errorf("invalid key want=%d got=%d", k, rk)
 						}
+						if ri < 0 || ri >= n {
+							t.Error("invalid goroutine number: ", ri)
+						} else {
+							tx := atomic.LoadUint32(&(cnt[ri]))
+							if rx > tx {
+								t.Errorf("invalid seq number, %d > %d ", rx, tx)
+							}
+						}
+					} else if err != ErrNotFound {
+						t.Error("Get: got error: ", err)
+						return
 					}
-					atomic.AddUint32(&cnt[i], 1)
 				}
-			}(i)
-		}
+				atomic.AddUint32(&cnt[i], 1)
+			}
+		}(i)
+	}
 
-		time.Sleep(secs * time.Second)
-		atomic.StoreUint32(&stop, 1)
-		closeWg.Wait()
-	})
-
-	runtime.GOMAXPROCS(1)
+	time.Sleep(secs * time.Second)
+	atomic.StoreUint32(&stop, 1)
+	closeWg.Wait()
 }
 
-func TestDB_Concurrent2(t *testing.T) {
-	const n, n2 = 4, 4000
+func TestDB_ConcurrentIterator(t *testing.T) {
+	const n, n2 = 4, 1000
+	h := newDbHarnessWopt(t, &opt.Options{DisableLargeBatchTransaction: true, WriteBuffer: 30})
+	defer h.close()
 
-	runtime.GOMAXPROCS(n*2 + 2)
-	truno(t, &opt.Options{DisableLargeBatchTransaction: true, WriteBuffer: 30}, func(h *dbHarness) {
-		var closeWg sync.WaitGroup
-		var stop uint32
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
-		for i := 0; i < n; i++ {
-			closeWg.Add(1)
-			go func(i int) {
-				for k := 0; atomic.LoadUint32(&stop) == 0; k++ {
-					h.put(fmt.Sprintf("k%d", k), fmt.Sprintf("%d.%d.", k, i)+strings.Repeat("x", 10))
+	var (
+		closeWg sync.WaitGroup
+		stop    uint32
+	)
+
+	for i := 0; i < n; i++ {
+		closeWg.Add(1)
+		go func(i int) {
+			for k := 0; atomic.LoadUint32(&stop) == 0; k++ {
+				h.put(fmt.Sprintf("k%d", k), fmt.Sprintf("%d.%d.", k, i)+strings.Repeat("x", 10))
+			}
+			closeWg.Done()
+		}(i)
+	}
+
+	for i := 0; i < n; i++ {
+		closeWg.Add(1)
+		go func(i int) {
+			for k := 1000000; k < 0 || atomic.LoadUint32(&stop) == 0; k-- {
+				h.put(fmt.Sprintf("k%d", k), fmt.Sprintf("%d.%d.", k, i)+strings.Repeat("x", 10))
+			}
+			closeWg.Done()
+		}(i)
+	}
+
+	cmp := comparer.DefaultComparer
+	for i := 0; i < n2; i++ {
+		closeWg.Add(1)
+		go func(i int) {
+			it := h.db.NewIterator(nil, nil)
+			var pk []byte
+			for it.Next() {
+				kk := it.Key()
+				if cmp.Compare(kk, pk) <= 0 {
+					t.Errorf("iter %d: %q is successor of %q", i, pk, kk)
 				}
-				closeWg.Done()
-			}(i)
-		}
-
-		for i := 0; i < n; i++ {
-			closeWg.Add(1)
-			go func(i int) {
-				for k := 1000000; k < 0 || atomic.LoadUint32(&stop) == 0; k-- {
-					h.put(fmt.Sprintf("k%d", k), fmt.Sprintf("%d.%d.", k, i)+strings.Repeat("x", 10))
+				pk = append(pk[:0], kk...)
+				var k, vk, vi int
+				if n, err := fmt.Sscanf(string(it.Key()), "k%d", &k); err != nil {
+					t.Errorf("iter %d: Scanf error on key %q: %v", i, it.Key(), err)
+				} else if n < 1 {
+					t.Errorf("iter %d: Cannot parse key %q", i, it.Key())
 				}
-				closeWg.Done()
-			}(i)
-		}
-
-		cmp := comparer.DefaultComparer
-		for i := 0; i < n2; i++ {
-			closeWg.Add(1)
-			go func(i int) {
-				it := h.db.NewIterator(nil, nil)
-				var pk []byte
-				for it.Next() {
-					kk := it.Key()
-					if cmp.Compare(kk, pk) <= 0 {
-						t.Errorf("iter %d: %q is successor of %q", i, pk, kk)
-					}
-					pk = append(pk[:0], kk...)
-					var k, vk, vi int
-					if n, err := fmt.Sscanf(string(it.Key()), "k%d", &k); err != nil {
-						t.Errorf("iter %d: Scanf error on key %q: %v", i, it.Key(), err)
-					} else if n < 1 {
-						t.Errorf("iter %d: Cannot parse key %q", i, it.Key())
-					}
-					if n, err := fmt.Sscanf(string(it.Value()), "%d.%d", &vk, &vi); err != nil {
-						t.Errorf("iter %d: Scanf error on value %q: %v", i, it.Value(), err)
-					} else if n < 2 {
-						t.Errorf("iter %d: Cannot parse value %q", i, it.Value())
-					}
-
-					if vk != k {
-						t.Errorf("iter %d: invalid value i=%d, want=%d got=%d", i, vi, k, vk)
-					}
+				if n, err := fmt.Sscanf(string(it.Value()), "%d.%d", &vk, &vi); err != nil {
+					t.Errorf("iter %d: Scanf error on value %q: %v", i, it.Value(), err)
+				} else if n < 2 {
+					t.Errorf("iter %d: Cannot parse value %q", i, it.Value())
 				}
-				if err := it.Error(); err != nil {
-					t.Errorf("iter %d: Got error: %v", i, err)
+
+				if vk != k {
+					t.Errorf("iter %d: invalid value i=%d, want=%d got=%d", i, vi, k, vk)
 				}
-				it.Release()
-				closeWg.Done()
-			}(i)
-		}
+			}
+			if err := it.Error(); err != nil {
+				t.Errorf("iter %d: Got error: %v", i, err)
+			}
+			it.Release()
+			closeWg.Done()
+		}(i)
+	}
 
-		atomic.StoreUint32(&stop, 1)
-		closeWg.Wait()
-	})
+	atomic.StoreUint32(&stop, 1)
+	closeWg.Wait()
+}
 
-	runtime.GOMAXPROCS(1)
+func TestDB_ConcurrentWrite(t *testing.T) {
+	const n, niter = 10, 10000
+	h := newDbHarness(t)
+	defer h.close()
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for k := 0; k < niter; k++ {
+				kstr := fmt.Sprintf("%d.%d", i, k)
+				vstr := fmt.Sprintf("v%d", k)
+				h.put(kstr, vstr)
+				// Key should immediately available after put returns.
+				h.getVal(kstr, vstr)
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestDB_CreateReopenDbOnFile(t *testing.T) {
@@ -2498,7 +2530,7 @@ func TestDB_TableCompactionBuilder(t *testing.T) {
 			key := []byte(fmt.Sprintf("%09d", k))
 			seq += nSeq - 1
 			for x := uint64(0); x < nSeq; x++ {
-				if err := tw.append(makeIkey(nil, key, seq-x, ktVal), value); err != nil {
+				if err := tw.append(makeInternalKey(nil, key, seq-x, keyTypeVal), value); err != nil {
 					t.Fatal(err)
 				}
 			}
