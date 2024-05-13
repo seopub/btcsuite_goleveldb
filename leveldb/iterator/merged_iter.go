@@ -7,9 +7,9 @@
 package iterator
 
 import (
-	"github.com/btcsuite/goleveldb/leveldb/comparer"
-	"github.com/btcsuite/goleveldb/leveldb/errors"
-	"github.com/btcsuite/goleveldb/leveldb/util"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/comparer"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/errors"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/util"
 )
 
 type dir int

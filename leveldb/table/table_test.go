@@ -12,11 +12,11 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	"github.com/btcsuite/goleveldb/leveldb/iterator"
-	"github.com/btcsuite/goleveldb/leveldb/opt"
-	"github.com/btcsuite/goleveldb/leveldb/storage"
-	"github.com/btcsuite/goleveldb/leveldb/testutil"
-	"github.com/btcsuite/goleveldb/leveldb/util"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/iterator"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/opt"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/storage"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/testutil"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/util"
 )
 
 type tableWrapper struct {

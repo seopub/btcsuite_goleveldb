@@ -11,9 +11,9 @@ import (
 
 	. "github.com/onsi/ginkgo"
 
-	"github.com/btcsuite/goleveldb/leveldb/comparer"
-	. "github.com/btcsuite/goleveldb/leveldb/iterator"
-	"github.com/btcsuite/goleveldb/leveldb/testutil"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/comparer"
+	. "github.com/seopub/btcsuite_goleveldb/leveldb/iterator"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/testutil"
 )
 
 type keyValue struct {

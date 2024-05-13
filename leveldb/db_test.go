@@ -25,14 +25,14 @@ import (
 
 	"github.com/onsi/gomega"
 
-	"github.com/btcsuite/goleveldb/leveldb/comparer"
-	"github.com/btcsuite/goleveldb/leveldb/errors"
-	"github.com/btcsuite/goleveldb/leveldb/filter"
-	"github.com/btcsuite/goleveldb/leveldb/iterator"
-	"github.com/btcsuite/goleveldb/leveldb/opt"
-	"github.com/btcsuite/goleveldb/leveldb/storage"
-	"github.com/btcsuite/goleveldb/leveldb/testutil"
-	"github.com/btcsuite/goleveldb/leveldb/util"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/comparer"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/errors"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/filter"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/iterator"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/opt"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/storage"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/testutil"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/util"
 )
 
 func tkey(i int) []byte {

@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/btcsuite/goleveldb/leveldb/journal"
-	"github.com/btcsuite/goleveldb/leveldb/memdb"
-	"github.com/btcsuite/goleveldb/leveldb/storage"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/journal"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/memdb"
+	"github.com/seopub/btcsuite_goleveldb/leveldb/storage"
 )
 
 var (
