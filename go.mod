@@ -1,4 +1,4 @@
-module github.com/btcsuite/goleveldb
+module github.com/seopub/btcsuite_goleveldb
 
 require (
 	github.com/btcsuite/snappy-go v1.0.0
